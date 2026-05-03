@@ -28,7 +28,8 @@ jobs:
           curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
                -L "${{ secrets.SERVER_LIST_URL }}" -o server_list.txt
 
-          while IFS='|' read -r IP_PORT HOSTNAME; do
+          # Sử dụng File Descriptor 3 để tránh xung đột với lệnh SSH
+          while IFS='|' read -u 3 -r IP_PORT HOSTNAME; do
             [[ $IP_PORT =~ ^# || -z $IP_PORT ]] && continue
             
             echo "::add-mask::$IP_PORT"
@@ -36,18 +37,21 @@ jobs:
             
             IP=$(echo $IP_PORT | cut -d':' -f1); PORT=$(echo $IP_PORT | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # 1. TẠO THƯ MỤC & CÀI RCLONE NẾU CHƯA CÓ
-            ssh -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP \
+            echo "--- Processing: $HOSTNAME ---"
+
+            # Thêm -n vào SSH và điều hướng /dev/null để không bị ngắt vòng lặp
+            # 1. Setup môi trường & Rclone
+            ssh -n -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP \
                 "mkdir -p ~/.config/rclone /usr/local/bin && \
                  echo '$HOSTNAME' > /etc/vps_id && \
-                 if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi"
+                 if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi" < /dev/null
 
-            # 2. ĐẨY CONFIG & SCRIPT (Đường dẫn chuẩn tuyệt đối)
+            # 2. Đẩy file
             scp -q -P $PORT -i ~/.ssh/id_backup_key ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf
             scp -q -P $PORT -i ~/.ssh/id_backup_key ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager
             
-            # 3. THỰC THI BACKUP
-            ssh -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup"
+            # 3. Chạy backup
+            ssh -n -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup" < /dev/null
             
-            echo "Processed a node successfully."
-          done < server_list.txt
+            echo "Successfully triggered backup for $HOSTNAME"
+          done 3< server_list.txt
