@@ -20,27 +20,27 @@ jobs:
 
       - name: Stealth Execution
         run: |
-          # Lấy danh sách server bí mật
           curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
                -L "${{ secrets.SERVER_LIST_URL }}" -o server_list.txt
 
           while IFS='|' read -r IP_PORT HOSTNAME; do
             [[ $IP_PORT =~ ^# || -z $IP_PORT ]] && continue
             
-            # Masking để che dấu vết trên Public Action
             echo "::add-mask::$IP_PORT"
             echo "::add-mask::$HOSTNAME"
             
             IP=$(echo $IP_PORT | cut -d':' -f1); PORT=$(echo $IP_PORT | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # Quy trình thực thi im lặng (-q)
-            # 1. Định danh node & Đẩy config
-            ssh -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP "echo '$HOSTNAME' > /etc/vps_id"
-            scp -q -P $PORT -i ~/.ssh/id_backup_key ~/.config/rclone/rclone.conf root@$IP:~/.config/rclone/rclone.conf
+            # --- FIX LỖI TẠI ĐÂY ---
+            # Bước 1: Tạo thư mục đích trên VPS TRƯỚC KHI SCP
+            ssh -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id"
+
+            # Bước 2: Đẩy file (Dùng đường dẫn tuyệt đối /root/ để đảm bảo không lỗi)
+            scp -q -P $PORT -i ~/.ssh/id_backup_key ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf
             scp -q -P $PORT -i ~/.ssh/id_backup_key ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager
             
-            # 2. Kích hoạt backup
+            # Bước 3: Cấp quyền và chạy backup
             ssh -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup"
             
-            echo "Processed: ***" # Log cực ngắn để bảo mật
+            echo "Processed a node successfully."
           done < server_list.txt
