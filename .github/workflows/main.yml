@@ -1,6 +1,6 @@
 name: Silent GitOps Backup
 on:
-  workflow_dispatch: # Chỉ chạy khi bạn nhấn nút hoặc gọi API từ Cronjob bên ngoài
+  workflow_dispatch:
   # schedule:
   #   - cron: '0 */6 * * *'
 
@@ -12,11 +12,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Environment
+        # FIX RCLONE LỖI OAUTH: Đưa secret vào ENV trước để bảo toàn định dạng JSON
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_CONTENT }}
         run: |
           mkdir -p ~/.ssh ~/.config/rclone
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
-          echo "${{ secrets.RCLONE_CONFIG_CONTENT }}" > ~/.config/rclone/rclone.conf
+          
+          # Đổ dữ liệu file conf an toàn từ biến ENV
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
       - name: Stealth Execution
         run: |
@@ -31,18 +36,18 @@ jobs:
             
             IP=$(echo $IP_PORT | cut -d':' -f1); PORT=$(echo $IP_PORT | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # 1. TẠO THƯ MỤC & CÀI ĐẶT RCLONE NẾU CHƯA CÓ
+            # 1. TẠO THƯ MỤC & CÀI RCLONE NẾU CHƯA CÓ
             ssh -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP \
                 "mkdir -p ~/.config/rclone /usr/local/bin && \
                  echo '$HOSTNAME' > /etc/vps_id && \
                  if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi"
 
-            # 2. ĐẨY CONFIG & SCRIPT
+            # 2. ĐẨY CONFIG & SCRIPT (Đường dẫn chuẩn tuyệt đối)
             scp -q -P $PORT -i ~/.ssh/id_backup_key ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf
             scp -q -P $PORT -i ~/.ssh/id_backup_key ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager
             
-            # 3. THỰC THI
+            # 3. THỰC THI BACKUP
             ssh -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup"
             
-            echo "Success."
+            echo "Processed a node successfully."
           done < server_list.txt
