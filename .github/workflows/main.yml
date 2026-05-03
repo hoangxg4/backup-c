@@ -31,16 +31,18 @@ jobs:
             
             IP=$(echo $IP_PORT | cut -d':' -f1); PORT=$(echo $IP_PORT | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # --- FIX LỖI TẠI ĐÂY ---
-            # Bước 1: Tạo thư mục đích trên VPS TRƯỚC KHI SCP
-            ssh -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id"
+            # 1. TẠO THƯ MỤC & CÀI ĐẶT RCLONE NẾU CHƯA CÓ
+            ssh -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP \
+                "mkdir -p ~/.config/rclone /usr/local/bin && \
+                 echo '$HOSTNAME' > /etc/vps_id && \
+                 if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi"
 
-            # Bước 2: Đẩy file (Dùng đường dẫn tuyệt đối /root/ để đảm bảo không lỗi)
+            # 2. ĐẨY CONFIG & SCRIPT
             scp -q -P $PORT -i ~/.ssh/id_backup_key ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf
             scp -q -P $PORT -i ~/.ssh/id_backup_key ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager
             
-            # Bước 3: Cấp quyền và chạy backup
+            # 3. THỰC THI
             ssh -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup"
             
-            echo "Processed a node successfully."
+            echo "Success."
           done < server_list.txt
