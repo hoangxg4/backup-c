@@ -13,7 +13,7 @@ mkdir -p $BACKUP_DIR $ROLLBACK_DIR
 case "$1" in
     backup)
         FILE_NAME="${MY_NAME}_${DATE}.tar.gz"
-        tar -czf "$BACKUP_DIR/$FILE_NAME" /var/lib/docker/volumes /data/coolify
+        tar -czf "$BACKUP_DIR/$FILE_NAME" -C /var/lib/docker/volumes /data/coolify
         rclone copy "$BACKUP_DIR/$FILE_NAME" "$DRIVE_PATH"
         rm -f "$BACKUP_DIR/$FILE_NAME"
         
