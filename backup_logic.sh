@@ -13,17 +13,19 @@ mkdir -p $BACKUP_DIR $ROLLBACK_DIR
 case "$1" in
     backup)
         FILE_NAME="${MY_NAME}_${DATE}.tar.gz"
-        tar -czf "$BACKUP_DIR/$FILE_NAME" -C /var/lib/docker/volumes /data/coolify
+        
+        # FIX LỖI CẢNH BÁO TAR: Sử dụng -C / và bỏ dấu / ở đầu các mục
+        tar -czf "$BACKUP_DIR/$FILE_NAME" -C / var/lib/docker/volumes data/coolify
+        
         rclone copy "$BACKUP_DIR/$FILE_NAME" "$DRIVE_PATH"
         rm -f "$BACKUP_DIR/$FILE_NAME"
         
-        # Dọn dẹp: Giữ 7 ngày và xóa sạch thùng rác Drive
+        # Dọn dẹp: Giữ 7 ngày và xóa thùng rác
         rclone delete "$DRIVE_BASE" --min-age 7d --rmdirs
         rclone cleanup "$DRIVE_BASE"
         ;;
         
     restore)
-        # Tìm file trên Drive (Recursive tìm mọi tháng)
         FILES=$(rclone lsf "$DRIVE_BASE" --recursive | grep "^.*/${MY_NAME}_" | sort -r)
         
         if [ -z "$FILES" ]; then echo "Error: No backup found!"; exit 1; fi
@@ -36,7 +38,7 @@ case "$1" in
 
         # Rollback local trước khi đè dữ liệu
         echo "🛡️ Creating local rollback..."
-        tar -czf "$ROLLBACK_DIR/ROLLBACK_${MY_NAME}_${DATE}.tar.gz" /var/lib/docker/volumes /data/coolify
+        tar -czf "$ROLLBACK_DIR/ROLLBACK_${MY_NAME}_${DATE}.tar.gz" -C / var/lib/docker/volumes data/coolify
         
         # Download & Extract
         rclone copy "$DRIVE_BASE/$SELECTED_FILE" "$BACKUP_DIR/"
