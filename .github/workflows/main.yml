@@ -1,7 +1,7 @@
 name: Global Silent Backup
 on:
   schedule:
-    - cron: '0 */6 * * *' # 6 tiếng chạy 1 lần
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -11,59 +11,56 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Setup SSH Key
+      - name: Setup SSH Key & Rclone Config
         run: |
-          mkdir -p ~/.ssh
+          mkdir -p ~/.ssh ~/.config/rclone
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
-
-      - name: Setup Rclone Config
-        run: |
-          mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Execute Backup on All Servers
+      - name: Stealth Execution
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          # Cấu hình SSH tối ưu: Chống treo, tự nhận diện key, timeout 15s
+          TOKEN: ${{ secrets.GH_PAT }}
+          LIST_URL: ${{ secrets.SERVER_LIST_URL }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
         run: |
-          curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
-               -L "${{ secrets.SERVER_LIST_URL }}" -o server_list.txt
+          # Gọi bằng $TOKEN, GitHub sẽ không in dòng có chứa "***" ra màn hình nữa
+          curl -s -H "Authorization: token $TOKEN" -L "$LIST_URL" -o server_list.txt
 
-          DISCORD_SUMMARY=""
+          # Làm trống file summary
+          > summary.txt
 
           while IFS='|' read -u 3 -r IP_PORT HOSTNAME; do
             [[ $IP_PORT =~ ^# || -z $IP_PORT ]] && continue
             
-            IP=$(echo $IP_PORT | cut -d':' -f1); PORT=$(echo $IP_PORT | cut -s -d':' -f2); PORT=${PORT:-22}
-            echo "::group::Processing $HOSTNAME"
-
-            # 1. Chuẩn bị môi trường (Nếu lỗi kết nối sẽ bỏ qua sang server sau nhờ || true)
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi" < /dev/null || true
-            scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
-            scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
+            IP=$(echo "$IP_PORT" | cut -d':' -f1); PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # 2. Chạy Backup và lấy kết quả
-            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup" < /dev/null || echo "[BACKUP_STATUS] ERROR")
-            echo "$RAW_OUTPUT"
-
-            # 3. Tổng hợp báo cáo
+            # Đẩy file cực kỳ im lặng
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" < /dev/null || true
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "cat > ~/.config/rclone/rclone.conf" < ~/.config/rclone/rclone.conf || true
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "cat > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" < ./backup_logic.sh || true
+            
+            # CHẠY VÀ BẮT LOG (Không in bất kỳ thứ gì ra màn hình GitHub)
+            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup 2>/dev/null" < /dev/null || echo "[BACKUP_STATUS] ERROR")
+            
+            # GHI KẾT QUẢ VÀO FILE ẨN (Chỉ Discord mới thấy)
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
-              DISCORD_SUMMARY+="- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)\n"
+              echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
               SIZE=$(echo "$RAW_OUTPUT" | grep "\[BACKUP_STATUS\] SUCCESS" | cut -d'|' -f2)
-              DISCORD_SUMMARY+="- 🖥️ **$HOSTNAME**: ✅ Backup OK (\`$SIZE\`)\n"
+              echo "- 🖥️ **$HOSTNAME**: ✅ Backup OK (\`$SIZE\`)" >> summary.txt
+            elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] ERROR_UPLOAD"; then
+              echo "- 🖥️ **$HOSTNAME**: ❌ Lỗi Google Drive (Rclone)" >> summary.txt
             else
-              DISCORD_SUMMARY+="- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Lỗi kết nối\n"
+              echo "- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Timeout" >> summary.txt
             fi
-            echo "::endgroup::"
             
           done 3< server_list.txt
 
-          # 4. Gửi Discord duy nhất 1 lần
-          if [ -n "$WEBHOOK" ]; then
-            jq -n --arg desc "$DISCORD_SUMMARY" '{
+          # GỬI DISCORD BÍ MẬT
+          if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
+            jq -n --rawfile desc summary.txt '{
               embeds: [{
                 title: "📊 Báo Cáo Backup Hệ Thống",
                 description: $desc,
@@ -71,5 +68,6 @@ jobs:
                 footer: {text: "Retention: 10 Files • Permanent Delete • No Logs/Sockets"}
               }]
             }' > discord.json
+            
             curl -s -H "Content-Type: application/json" -d @discord.json "$WEBHOOK" > /dev/null
           fi
