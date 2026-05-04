@@ -11,13 +11,18 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Setup SSH Key
+      - name: Setup SSH Key & Local Files
         run: |
-          mkdir -p ~/.ssh
+          mkdir -p ~/.ssh ~/.config/rclone
+          # Tạo SSH Key
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
+          
+          # Giải mã rclone.conf thành file thật trên máy ảo Github Runner
+          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod +x ./backup_logic.sh
 
-      - name: Execution with Smart Log Masking
+      - name: Execution with SCP
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
@@ -25,15 +30,9 @@ jobs:
           export GH_TOKEN="${{ secrets.GH_PAT }}"
           export LIST_URL="${{ secrets.SERVER_LIST_URL }}"
           
-          # 1. Tải danh sách Server
+          # Tải danh sách Server
           curl -s -H "Authorization: token $GH_TOKEN" -L "$LIST_URL" -o server_list.txt
           sed -i 's/\r//g' server_list.txt
-          
-          # 2. Làm sạch chuỗi Base64 Config (Loại bỏ khoảng trắng rác nếu có)
-          CLEAN_RCLONE_B64=$(echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | tr -d '[:space:]')
-          
-          # 3. Mã hóa script backup logic để đẩy đi an toàn
-          B64_SCRIPT=$(base64 -w0 ./backup_logic.sh)
           
           > summary.txt
 
@@ -46,28 +45,27 @@ jobs:
             IP=$(echo "$IP_PORT" | cut -d':' -f1)
             PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # Masking để giấu IP/Hostname trên log của GitHub
+            # Giấu thông tin nhạy cảm trên log
             echo "::add-mask::$IP"
             echo "::add-mask::$HOSTNAME"
             
             echo "----------------------------------------"
             echo "Processing Server: ***" 
             
-            # 1. Khởi tạo thư mục và cài đặt rclone (nếu thiếu)
+            # 1. Khởi tạo thư mục trên VPS
             ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
             
-            # 2. Đẩy file rclone.conf (Chính xác 100%, không bao giờ 0 byte)
-            echo "$CLEAN_RCLONE_B64" | ssh -q -p $PORT $SSH_OPTS root@$IP "base64 -d > /root/.config/rclone/rclone.conf" || true
+            # 2. Dùng SCP để đẩy file qua - Cực kỳ an toàn, file sao y bản chính 100%
+            scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
+            scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
             
-            # 3. Đẩy file script backup
-            echo "$B64_SCRIPT" | ssh -q -p $PORT $SSH_OPTS root@$IP "base64 -d > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" || true
-            
-            # 4. CHẠY VÀ IN LOG DEBUG
+            # 3. Chạy lệnh backup và in log debug
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager" || true
             RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
             
             echo "$RAW_OUTPUT"
             
-            # 5. PHÂN TÍCH KẾT QUẢ GỬI DISCORD
+            # 4. Phân tích kết quả
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
               echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
@@ -81,7 +79,7 @@ jobs:
             
           done 3< server_list.txt
 
-          # 6. GỬI DISCORD
+          # 5. Gửi báo cáo về Discord
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
