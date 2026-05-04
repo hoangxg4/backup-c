@@ -16,20 +16,20 @@ jobs:
           mkdir -p ~/.ssh ~/.config/rclone
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
-          
-          # Giải mã rclone config ra file text chuẩn trên máy ảo Github
-          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Execution
+      - name: Execution with Smart Log Masking
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
+          RCLONE_B64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
         run: |
           export GH_TOKEN="${{ secrets.GH_PAT }}"
           export LIST_URL="${{ secrets.SERVER_LIST_URL }}"
           
           curl -s -H "Authorization: token $GH_TOKEN" -L "$LIST_URL" -o server_list.txt
           sed -i 's/\r//g' server_list.txt
+          
+          B64_SCRIPT=$(base64 -w0 ./backup_logic.sh)
           
           > summary.txt
 
@@ -42,28 +42,22 @@ jobs:
             IP=$(echo "$IP_PORT" | cut -d':' -f1)
             PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # Masking để giấu IP/Hostname trên log
             echo "::add-mask::$IP"
             echo "::add-mask::$HOSTNAME"
             
             echo "----------------------------------------"
             echo "Processing Server: ***" 
             
-            # 1. Khởi tạo thư mục (vẫn tàng hình)
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
+            # Khởi tạo thư mục và đưa file lên nguyên vẹn 100%
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" < /dev/null || true
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$RCLONE_B64' | base64 -d > /root/.config/rclone/rclone.conf" || true
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$B64_SCRIPT' | base64 -d > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" || true
             
-            # 2. Đẩy Rclone Config BẰNG ĐƯỜNG ỐNG TRỰC TIẾP (Cam kết đúng nội dung 100%)
-            cat ~/.config/rclone/rclone.conf | ssh -q -p $PORT $SSH_OPTS root@$IP "cat > /root/.config/rclone/rclone.conf" || true
-            
-            # 3. Đẩy file script BẰNG ĐƯỜNG ỐNG TRỰC TIẾP
-            cat ./backup_logic.sh | ssh -q -p $PORT $SSH_OPTS root@$IP "cat > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" || true
-            
-            # 4. CHẠY VÀ IN LOG DEBUG
-            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
+            # CHẠY VÀ IN LOG
+            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" < /dev/null || echo "[BACKUP_STATUS] ERROR_SSH")
             
             echo "$RAW_OUTPUT"
             
-            # 5. PHÂN TÍCH KẾT QUẢ
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
               echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
@@ -77,7 +71,7 @@ jobs:
             
           done 3< server_list.txt
 
-          # 6. GỬI DISCORD
+          # GỬI DISCORD
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
