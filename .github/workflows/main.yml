@@ -16,29 +16,17 @@ jobs:
           RCLONE_CONTENT: ${{ secrets.RCLONE_CONFIG_CONTENT }}
         run: |
           mkdir -p ~/.ssh ~/.config/rclone
-          # 1. Tạo SSH Key
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
           
-          # 2. Ghi trực tiếp nội dung raw vào file rclone.conf
           if [ -z "$RCLONE_CONTENT" ]; then
-            echo "❌ LỖI: Không tìm thấy Secret 'RCLONE_CONFIG_CONTENT' trên GitHub!"
+            echo "❌ LỖI: Không tìm thấy Secret 'RCLONE_CONFIG_CONTENT'!"
             exit 1
           fi
           echo "$RCLONE_CONTENT" > ~/.config/rclone/rclone.conf
-
-          # 3. DEBUG TRÊN GITHUB RUNNER: Kiểm tra xem file đã có dữ liệu chưa
-          FILE_SIZE=$(wc -c < ~/.config/rclone/rclone.conf)
-          echo "=== DEBUG TRÊN GITHUB RUNNER ==="
-          echo "Kích thước file rclone.conf tạo ra: $FILE_SIZE bytes"
-          if [ "$FILE_SIZE" -eq 0 ]; then
-            echo "❌ LỖI: File rclone.conf vẫn bị 0 bytes. Vui lòng kiểm tra lại giá trị Secret!"
-            exit 1
-          fi
-          echo "================================="
           chmod +x ./backup_logic.sh
 
-      - name: Execution with SCP
+      - name: Execution with Silent Logs
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
@@ -64,42 +52,50 @@ jobs:
             echo "::add-mask::$IP"
             echo "::add-mask::$HOSTNAME"
             
-            echo "----------------------------------------"
-            echo "Processing Server: ***" 
+            # Tạo file log tạm riêng cho từng server
+            > /tmp/vps.log
             
-            # 1. Tạo thư mục trên VPS
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
-            
-            # 2. Dùng SCP để đẩy file qua (Giống như WinSCP) - Copy file sao y bản chính 100%
-            scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
-            scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
-            
-            # 3. DEBUG TRÊN VPS: Xem kích thước file sau khi truyền qua
-            echo "--- DEBUG TRÊN VPS ---"
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "ls -la /root/.config/rclone/rclone.conf && echo 'File trên VPS nhận được:' && wc -c < /root/.config/rclone/rclone.conf" || true
-            echo "----------------------"
+            # Ghi toàn bộ tiến trình vào file log tạm
+            {
+              echo "----------------------------------------"
+              echo "Processing Server: $HOSTNAME ($IP:$PORT)"
+              
+              # 1. Tạo thư mục trên VPS
+              ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
+              
+              # 2. Dùng SCP để đẩy file qua
+              scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
+              scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
+              
+              # 3. Chạy backup
+              ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager" || true
+              RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
+              
+              echo "$RAW_OUTPUT"
+            } &> /tmp/vps.log
 
-            # 4. Chạy backup
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager" || true
-            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
-            
-            echo "$RAW_OUTPUT"
-            
-            # 5. Phân tích kết quả
-            if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
-              echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
-            elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
-              SIZE=$(echo "$RAW_OUTPUT" | grep "\[BACKUP_STATUS\] SUCCESS" | cut -d'|' -f2)
+            # Kiểm tra kết quả trong file log vừa lưu
+            if grep -q "\[BACKUP_STATUS\] SUCCESS" /tmp/vps.log; then
+              SIZE=$(grep "\[BACKUP_STATUS\] SUCCESS" /tmp/vps.log | cut -d'|' -f2)
               echo "- 🖥️ **$HOSTNAME**: ✅ Backup OK (\`$SIZE\`)" >> summary.txt
-            elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] ERROR_UPLOAD"; then
-              echo "- 🖥️ **$HOSTNAME**: ❌ Lỗi Google Drive (Rclone)" >> summary.txt
+            elif grep -q "\[BACKUP_STATUS\] SKIP" /tmp/vps.log; then
+              echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             else
-              echo "- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Lỗi SSH" >> summary.txt
+              # NẾU CÓ LỖI: In toàn bộ log tạm ra GitHub Actions để bạn debug
+              echo "::error title=Backup Failed::Phát hiện lỗi trên server $HOSTNAME"
+              cat /tmp/vps.log
+              echo "----------------------------------------"
+              
+              if grep -q "\[BACKUP_STATUS\] ERROR_UPLOAD" /tmp/vps.log; then
+                echo "- 🖥️ **$HOSTNAME**: ❌ Lỗi Google Drive (Rclone)" >> summary.txt
+              else
+                echo "- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Lỗi SSH" >> summary.txt
+              fi
             fi
             
           done 3< server_list.txt
 
-          # 6. Gửi báo cáo về Discord
+          # Gửi báo cáo về Discord
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
