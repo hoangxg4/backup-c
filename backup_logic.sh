@@ -3,23 +3,19 @@ MY_NAME=$(cat /etc/vps_id)
 DATE=$(date +%Y%m%d_%H%M)
 BACKUP_DIR="/tmp/backup_stage"
 ROLLBACK_DIR="/root/backup_rollback"
-MONTH_FOLDER=$(date +%m-%Y)
-DRIVE_SERVER_ROOT="gdrive:Coolify_Backups/$MY_NAME"
-DRIVE_DEST="$DRIVE_SERVER_ROOT/$MONTH_FOLDER"
+DRIVE_DEST="gdrive:Coolify_Backups/$MY_NAME"
 MARKER_FILE="/etc/vps_last_backup"
 
 mkdir -p $BACKUP_DIR $ROLLBACK_DIR
 
-# --- HÀM GỬI DISCORD "COOL NGẦU" ---
+# --- HÀM THÔNG BÁO DISCORD ---
 send_discord() {
     local COLOR=$1
     local STATUS_TITLE=$2
     local DESC=$3
     
-    if [ -z "$DISCORD_WEBHOOK" ]; then return 0; fi
-
-    # Tạo JSON cho Discord Embed
-    cat <<EOF > /tmp/discord.json
+    if [ -n "$DISCORD_WEBHOOK" ]; then
+        cat <<EOF > /tmp/discord.json
 {
   "embeds": [{
     "title": "$STATUS_TITLE",
@@ -27,102 +23,79 @@ send_discord() {
     "color": $COLOR,
     "fields": [
       {"name": "🖥️ Server", "value": "\`$MY_NAME\`", "inline": true},
-      {"name": "📂 Month Folder", "value": "\`$MONTH_FOLDER\`", "inline": true}
+      {"name": "⚙️ Status", "value": "\`Permanent Delete Active\`", "inline": true}
     ],
-    "footer": {"text": "Silent GitOps Backup • $(date +'%Y-%m-%d %H:%M')"}
+    "footer": {"text": "GitOps Backup System • $(date +'%Y-%m-%d %H:%M')"}
   }]
 }
 EOF
-    curl -s -H "Content-Type: application/json" -d @/tmp/discord.json "$DISCORD_WEBHOOK" > /dev/null
-}
-
-cleanup_gfs() {
-    local TAG=$1
-    local KEEP_LIMIT=$2
-    local ALL_FILES=$(rclone lsf "$DRIVE_SERVER_ROOT" --recursive | grep "_${TAG}_" | sort -r)
-    local TO_DELETE=$(echo "$ALL_FILES" | tail -n +$((KEEP_LIMIT + 1)))
-    
-    for FILE_PATH in $TO_DELETE; do
-        if [ -n "$FILE_PATH" ]; then
-            rclone deletefile "$DRIVE_SERVER_ROOT/$FILE_PATH"
-        fi
-    done
+        curl -s -H "Content-Type: application/json" -d @/tmp/discord.json "$DISCORD_WEBHOOK" > /dev/null
+    fi
 }
 
 case "$1" in
     backup)
-        # --- 1. CHECK THAY ĐỔI ---
+        # --- 1. CHỈ BACKUP KHI CÓ THAY ĐỔI ---
         if [ -f "$MARKER_FILE" ]; then
             CHANGES=$(find /var/lib/docker/volumes /data/coolify -type f \
                 -not -path "*/logs/*" -not -name "*.log" \
                 -newer "$MARKER_FILE" | head -n 1)
+            
             if [ -z "$CHANGES" ]; then
-                send_discord "8421504" "💤 Bỏ Qua Backup" "Không có dữ liệu mới nào được sinh ra (đã loại trừ logs)."
+                send_discord "8421504" "💤 Skip" "Dữ liệu không đổi. Không có gì để backup."
                 exit 0
             fi
         fi
 
-        # --- 2. NÉN DAILY & TÍNH DUNG LƯỢNG ---
-        DAILY_FILE="${MY_NAME}_D_${DATE}.tar.gz"
-        tar -czf "$BACKUP_DIR/$DAILY_FILE" -C / --exclude="*/logs/*" --exclude="*.log" var/lib/docker/volumes data/coolify
+        # --- 2. NÉN VÀ UPLOAD ---
+        FILE_NAME="${MY_NAME}_${DATE}.tar.gz"
+        tar -czf "$BACKUP_DIR/$FILE_NAME" -C / --exclude="*/logs/*" --exclude="*.log" var/lib/docker/volumes data/coolify
         
-        # Lấy dung lượng file để báo cáo Discord
-        FILE_SIZE=$(du -sh "$BACKUP_DIR/$DAILY_FILE" | awk '{print $1}')
+        FILE_SIZE=$(du -sh "$BACKUP_DIR/$FILE_NAME" | awk '{print $1}')
         
-        rclone copy "$BACKUP_DIR/$DAILY_FILE" "$DRIVE_DEST"
-        rm -f "$BACKUP_DIR/$DAILY_FILE"
+        # Upload lên Drive
+        rclone copy "$BACKUP_DIR/$FILE_NAME" "$DRIVE_DEST"
+        rm -f "$BACKUP_DIR/$FILE_NAME"
 
-        # --- 3. NHÂN BẢN GFS ---
-        D_DAY=$(date +%d)
-        D_WEEK=$(date +%u)
-        TAGS_CREATED="Daily (D)"
-
-        if [ "$D_WEEK" == "7" ]; then
-            WEEKLY_FILE="${MY_NAME}_W_${DATE}.tar.gz"
-            rclone copyto "$DRIVE_DEST/$DAILY_FILE" "$DRIVE_DEST/$WEEKLY_FILE"
-            TAGS_CREATED="$TAGS_CREATED, Weekly (W)"
+        # --- 3. DỌN DẸP & XÓA VĨNH VIỄN (TRASH BYPASS) ---
+        # Lấy danh sách file, sắp xếp mới nhất lên đầu, lấy các file từ thứ 11 trở đi để xóa
+        FILES_TO_DELETE=$(rclone lsf "$DRIVE_DEST" | grep "\.tar\.gz$" | sort -r | tail -n +11)
+        
+        if [ -n "$FILES_TO_DELETE" ]; then
+            for OLD_FILE in $FILES_TO_DELETE; do
+                # Flag --drive-use-trash=false sẽ xóa vĩnh viễn, không vào thùng rác
+                rclone deletefile "$DRIVE_DEST/$OLD_FILE" --drive-use-trash=false
+            done
         fi
 
-        if [ "$D_DAY" == "01" ]; then
-            MONTHLY_FILE="${MY_NAME}_M_${DATE}.tar.gz"
-            rclone copyto "$DRIVE_DEST/$DAILY_FILE" "$DRIVE_DEST/$MONTHLY_FILE"
-            TAGS_CREATED="$TAGS_CREATED, Monthly (M)"
-        fi
-
-        # --- 4. DỌN DẸP & XÓA THƯ MỤC RỖNG ---
-        cleanup_gfs "D" 4
-        cleanup_gfs "W" 7
-        cleanup_gfs "M" 4
-
-        # FIX: Dọn sạch các thư mục tháng (04-2026, 03-2026...) nếu bên trong không còn file nào
-        rclone rmdirs "$DRIVE_SERVER_ROOT" --leave-root 2>/dev/null || true
-
+        # Cập nhật marker
         touch "$MARKER_FILE"
-        rclone cleanup "gdrive:Coolify_Backups" -q >/dev/null 2>&1
         
-        # GỬI THÔNG BÁO THÀNH CÔNG LÊN DISCORD (Màu xanh lá = 3066993)
-        send_discord "3066993" "✅ Backup Thành Công" "**Dung lượng:** \`$FILE_SIZE\`\n**Tags:** \`$TAGS_CREATED\`\n**Đã áp dụng quy tắc:** \`4D-7W-4M\`"
+        # Dọn sạch các tàn dư khác nếu có trong thùng rác chung của Drive (cho chắc chắn)
+        rclone cleanup "gdrive:" -q >/dev/null 2>&1
+        
+        send_discord "3066993" "✅ Backup Success" "**File:** \`$FILE_NAME\`\n**Size:** \`$FILE_SIZE\`\n**Retention:** \`10 bản (Xóa vĩnh viễn)\`"
         ;;
 
     restore)
-        # (Logic khôi phục giữ nguyên như cũ)
-        FILES=$(rclone lsf "$DRIVE_SERVER_ROOT" --recursive | grep "\.tar\.gz$" | sort -r)
+        FILES=$(rclone lsf "$DRIVE_DEST" | grep "\.tar\.gz$" | sort -r)
         if [ -z "$FILES" ]; then echo "No backup found!"; exit 1; fi
 
         echo "--- CHỌN BẢN BACKUP ---"
-        PS3="Chọn số: "
+        PS3="Nhập số: "
         select SELECTED_FILE in $FILES; do
             if [ -n "$SELECTED_FILE" ]; then break; fi
         done
 
+        # Tạo rollback local
         tar -czf "$ROLLBACK_DIR/ROLLBACK_${MY_NAME}_${DATE}.tar.gz" -C / var/lib/docker/volumes data/coolify
-        rclone copy "$DRIVE_SERVER_ROOT/$SELECTED_FILE" "$BACKUP_DIR/"
-        FILENAME_ONLY=$(basename "$SELECTED_FILE")
-        tar -xzf "$BACKUP_DIR/$FILENAME_ONLY" -C /
-        rm -f "$BACKUP_DIR/$FILENAME_ONLY"
         
-        # Gửi thông báo Restore (Màu vàng = 16753920)
-        send_discord "16753920" "🔄 Restore Hoàn Tất" "**File khôi phục:** \`$FILENAME_ONLY\`\nĐã tạo Rollback dự phòng ở VPS."
-        echo "🚀 Khôi phục thành công!"
+        # Tải về và xả nén
+        rclone copy "$DRIVE_DEST/$SELECTED_FILE" "$BACKUP_DIR/"
+        tar -xzf "$BACKUP_DIR/$SELECTED_FILE" -C /
+        rm -f "$BACKUP_DIR/$SELECTED_FILE"
+        
+        send_discord "16753920" "🔄 Restore Done" "**Khôi phục từ:** \`$SELECTED_FILE\`"
+        echo "🚀 Restore thành công!"
         ;;
 esac
