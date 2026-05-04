@@ -18,7 +18,7 @@ jobs:
           chmod 600 ~/.ssh/id_backup_key
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
-      - name: Stealth Execution
+      - name: Execution with Smart Log Masking
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
@@ -29,7 +29,6 @@ jobs:
           curl -s -H "Authorization: token $GH_TOKEN" -L "$LIST_URL" -o server_list.txt
           sed -i 's/\r//g' server_list.txt
           
-          # Đóng gói file thành chuỗi an toàn (Chống xịt 100%)
           B64_CONF=$(base64 -w0 ~/.config/rclone/rclone.conf)
           B64_SCRIPT=$(base64 -w0 ./backup_logic.sh)
           
@@ -44,32 +43,42 @@ jobs:
             IP=$(echo "$IP_PORT" | cut -d':' -f1)
             PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # --- 1. SETUP BƯỚC ĐỆM ---
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" < /dev/null || true
+            # --- LỆNH CHE GIẤU THÔNG TIN CỦA GITHUB ---
+            # Từ lúc này trở đi, bất kỳ chỗ nào có chữ giống IP, Hostname sẽ biến thành ***
+            echo "::add-mask::$IP"
+            echo "::add-mask::$HOSTNAME"
             
-            # --- 2. GHI ĐÈ FILE TRỰC TIẾP QUA CHUỖI BASE64 ---
-            # Sẽ ghi đè tận gốc cái file 0 byte lỗi trên VPS của bạn
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$B64_CONF' | base64 -d > ~/.config/rclone/rclone.conf" || true
+            echo "----------------------------------------"
+            echo "Processing Server: ***" 
+            
+            # Đẩy file
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" < /dev/null || true
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$B64_CONF' | base64 -d > /root/.config/rclone/rclone.conf" || true
             ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$B64_SCRIPT' | base64 -d > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" || true
             
-            # --- 3. CHẠY BACKUP ---
-            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup 2>/dev/null" < /dev/null || echo "[BACKUP_STATUS] ERROR")
+            # CHẠY VÀ IN LOG RA MÀN HÌNH ACTION
+            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" < /dev/null || echo "[BACKUP_STATUS] ERROR_SSH")
             
-            # --- 4. BẮT KẾT QUẢ ---
+            # Hiển thị log của Rclone ra Github (Các thông tin nhạy cảm đã bị che)
+            echo "$RAW_OUTPUT"
+            
+            # Parse kết quả gửi Discord
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
               echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
               SIZE=$(echo "$RAW_OUTPUT" | grep "\[BACKUP_STATUS\] SUCCESS" | cut -d'|' -f2)
+              # Che luôn Size nếu muốn (tùy chọn)
+              # echo "::add-mask::$SIZE"
               echo "- 🖥️ **$HOSTNAME**: ✅ Backup OK (\`$SIZE\`)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] ERROR_UPLOAD"; then
               echo "- 🖥️ **$HOSTNAME**: ❌ Lỗi Google Drive (Rclone)" >> summary.txt
             else
-              echo "- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Timeout" >> summary.txt
+              echo "- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Lỗi SSH" >> summary.txt
             fi
             
           done 3< server_list.txt
 
-          # --- 5. GỬI DISCORD ---
+          # GỬI DISCORD
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
