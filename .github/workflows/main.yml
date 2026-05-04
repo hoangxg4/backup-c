@@ -14,50 +14,47 @@ jobs:
       - name: Setup SSH Key & Rclone Config
         run: |
           mkdir -p ~/.ssh ~/.config/rclone
-          
-          # FIX 1: Dùng EOF để bảo vệ tuyệt đối định dạng nhiều dòng của SSH Key
-          cat << 'EOF' > ~/.ssh/id_backup_key
-          ${{ secrets.SSH_PRIVATE_KEY }}
-          EOF
+          # Trả lại cách ghi Key cũ vì nó hoạt động ổn định nhất
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
-          
           echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
 
       - name: Stealth Execution
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          TOKEN: ${{ secrets.GH_PAT }}
-          LIST_URL: ${{ secrets.SERVER_LIST_URL }}
-          # FIX 2: Thêm BatchMode=yes để SSH dứt khoát không bao giờ treo đòi password
-          SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30 -o BatchMode=yes"
+          SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
         run: |
-          curl -s -H "Authorization: token $TOKEN" -L "$LIST_URL" -o server_list.txt
+          # Dùng biến môi trường cục bộ để log Github hiển thị gọn hơn
+          export GH_TOKEN="${{ secrets.GH_PAT }}"
+          export LIST_URL="${{ secrets.SERVER_LIST_URL }}"
           
-          # FIX 3: Tiêu diệt ký tự Windows (\r) ẩn trong file text gây lỗi IP
+          curl -s -H "Authorization: token $GH_TOKEN" -L "$LIST_URL" -o server_list.txt
+          
+          # Tẩy sạch ký tự ẩn (Windows \r) nếu có
           sed -i 's/\r//g' server_list.txt
           
           > summary.txt
 
           while IFS='|' read -u 3 -r IP_PORT HOSTNAME; do
-            # Bỏ qua dòng trống hoặc comment
             [[ "$IP_PORT" =~ ^# || -z "$IP_PORT" ]] && continue
             
-            # Lọc sạch khoảng trắng thừa cho chắc cốp
             IP_PORT=$(echo "$IP_PORT" | tr -d ' ')
             HOSTNAME=$(echo "$HOSTNAME" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             
             IP=$(echo "$IP_PORT" | cut -d':' -f1)
             PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # Đẩy file cấu hình và script (im lặng hoàn toàn)
+            # --- 1. SETUP (Im lặng) ---
             ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" < /dev/null || true
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "cat > ~/.config/rclone/rclone.conf" < ~/.config/rclone/rclone.conf || true
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "cat > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" < ./backup_logic.sh || true
             
-            # Chạy Backup
-            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup 2>/dev/null" < /dev/null || echo "[BACKUP_STATUS] ERROR")
+            # --- 2. TRUYỀN FILE BẰNG SCP (Đã fix lỗi 0 byte) ---
+            scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
+            scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
             
-            # Bắt kết quả
+            # --- 3. CHẠY SCRIPT ---
+            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup 2>/dev/null" < /dev/null || echo "[BACKUP_STATUS] ERROR")
+            
+            # --- 4. BẮT KẾT QUẢ ---
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
               echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
@@ -71,7 +68,7 @@ jobs:
             
           done 3< server_list.txt
 
-          # Gửi thông báo Discord
+          # --- 5. GỬI DISCORD ---
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
