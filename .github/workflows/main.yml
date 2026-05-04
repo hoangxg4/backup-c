@@ -6,14 +6,14 @@ on:
 
 jobs:
   backup:
-    runs-on: ubuntu-latest
+    runs-runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Setup SSH Key & Rclone Config
+      - name: Setup SSH Key
         run: |
-          mkdir -p ~/.ssh ~/.config/rclone
+          mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
 
@@ -21,14 +21,18 @@ jobs:
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
-          RCLONE_B64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
         run: |
           export GH_TOKEN="${{ secrets.GH_PAT }}"
           export LIST_URL="${{ secrets.SERVER_LIST_URL }}"
           
+          # 1. Tải danh sách Server
           curl -s -H "Authorization: token $GH_TOKEN" -L "$LIST_URL" -o server_list.txt
           sed -i 's/\r//g' server_list.txt
           
+          # 2. Làm sạch chuỗi Base64 Config (Loại bỏ khoảng trắng rác nếu có)
+          CLEAN_RCLONE_B64=$(echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | tr -d '[:space:]')
+          
+          # 3. Mã hóa script backup logic để đẩy đi an toàn
           B64_SCRIPT=$(base64 -w0 ./backup_logic.sh)
           
           > summary.txt
@@ -42,22 +46,28 @@ jobs:
             IP=$(echo "$IP_PORT" | cut -d':' -f1)
             PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
+            # Masking để giấu IP/Hostname trên log của GitHub
             echo "::add-mask::$IP"
             echo "::add-mask::$HOSTNAME"
             
             echo "----------------------------------------"
             echo "Processing Server: ***" 
             
-            # Khởi tạo thư mục và đưa file lên nguyên vẹn 100%
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" < /dev/null || true
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$RCLONE_B64' | base64 -d > /root/.config/rclone/rclone.conf" || true
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "echo '$B64_SCRIPT' | base64 -d > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" || true
+            # 1. Khởi tạo thư mục và cài đặt rclone (nếu thiếu)
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
             
-            # CHẠY VÀ IN LOG
-            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" < /dev/null || echo "[BACKUP_STATUS] ERROR_SSH")
+            # 2. Đẩy file rclone.conf (Chính xác 100%, không bao giờ 0 byte)
+            echo "$CLEAN_RCLONE_B64" | ssh -q -p $PORT $SSH_OPTS root@$IP "base64 -d > /root/.config/rclone/rclone.conf" || true
+            
+            # 3. Đẩy file script backup
+            echo "$B64_SCRIPT" | ssh -q -p $PORT $SSH_OPTS root@$IP "base64 -d > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" || true
+            
+            # 4. CHẠY VÀ IN LOG DEBUG
+            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
             
             echo "$RAW_OUTPUT"
             
+            # 5. PHÂN TÍCH KẾT QUẢ GỬI DISCORD
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
               echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
@@ -71,7 +81,7 @@ jobs:
             
           done 3< server_list.txt
 
-          # GỬI DISCORD
+          # 6. GỬI DISCORD
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
