@@ -26,76 +26,84 @@ jobs:
           echo "$RCLONE_CONTENT" > ~/.config/rclone/rclone.conf
           chmod +x ./backup_logic.sh
 
-      - name: Execution with Silent Logs
+      - name: Execution with Parallel & Silent Logs
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
         run: |
           export GH_TOKEN="${{ secrets.GH_PAT }}"
           export LIST_URL="${{ secrets.SERVER_LIST_URL }}"
+          export SSH_OPTS
           
-          # Tải danh sách Server
+          # 1. Tải danh sách Server
           curl -s -H "Authorization: token $GH_TOKEN" -L "$LIST_URL" -o server_list.txt
           sed -i 's/\r//g' server_list.txt
           
+          # 2. Tạo Script Worker để xử lý luồng song song
+          cat << 'EOF' > worker.sh
+          #!/bin/bash
+          LINE="$1"
+          [[ "$LINE" =~ ^# || -z "$LINE" ]] && exit 0
+          
+          IP_PORT=$(echo "$LINE" | cut -d'|' -f1 | tr -d ' ')
+          HOSTNAME=$(echo "$LINE" | cut -d'|' -f2 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          IP=$(echo "$IP_PORT" | cut -d':' -f1)
+          PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
+          
+          LOG_FILE="/tmp/log_${IP}.log"
+          
+          # Tiến trình thực thi cho 1 server
+          {
+            echo "Processing Server: $HOSTNAME ($IP:$PORT)"
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
+            scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
+            scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager" || true
+            
+            RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
+            echo "$RAW_OUTPUT"
+          } &> "$LOG_FILE"
+
+          # Trả về kết quả để tiến trình chính đọc
+          if grep -q "\[BACKUP_STATUS\] SUCCESS" "$LOG_FILE"; then
+            SIZE=$(grep "\[BACKUP_STATUS\] SUCCESS" "$LOG_FILE" | cut -d'|' -f2)
+            echo "SUCCESS|$HOSTNAME|$SIZE"
+          elif grep -q "\[BACKUP_STATUS\] SKIP" "$LOG_FILE"; then
+            echo "SKIP|$HOSTNAME"
+          else
+            echo "ERROR|$HOSTNAME|$LOG_FILE"
+          fi
+          EOF
+          chmod +x worker.sh
+
+          # 3. Chạy song song TẤT CẢ server cùng lúc (-P 0)
+          > results.txt
+          cat server_list.txt | xargs -I {} -P 0 ./worker.sh "{}" > results.txt
+
+          # 4. Phân tích kết quả tổng hợp
           > summary.txt
-
-          while IFS='|' read -u 3 -r IP_PORT HOSTNAME; do
-            [[ "$IP_PORT" =~ ^# || -z "$IP_PORT" ]] && continue
+          while IFS='|' read -r STATUS NAME EXTRA; do
+            if [ -z "$STATUS" ]; then continue; fi
             
-            IP_PORT=$(echo "$IP_PORT" | tr -d ' ')
-            HOSTNAME=$(echo "$HOSTNAME" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            
-            IP=$(echo "$IP_PORT" | cut -d':' -f1)
-            PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
-            
-            echo "::add-mask::$IP"
-            echo "::add-mask::$HOSTNAME"
-            
-            # Tạo file log tạm riêng cho từng server
-            > /tmp/vps.log
-            
-            # Ghi toàn bộ tiến trình vào file log tạm
-            {
-              echo "----------------------------------------"
-              echo "Processing Server: $HOSTNAME ($IP:$PORT)"
-              
-              # 1. Tạo thư mục trên VPS
-              ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
-              
-              # 2. Dùng SCP để đẩy file qua
-              scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
-              scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
-              
-              # 3. Chạy backup
-              ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager" || true
-              RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
-              
-              echo "$RAW_OUTPUT"
-            } &> /tmp/vps.log
-
-            # Kiểm tra kết quả trong file log vừa lưu
-            if grep -q "\[BACKUP_STATUS\] SUCCESS" /tmp/vps.log; then
-              SIZE=$(grep "\[BACKUP_STATUS\] SUCCESS" /tmp/vps.log | cut -d'|' -f2)
-              echo "- 🖥️ **$HOSTNAME**: ✅ Backup OK (\`$SIZE\`)" >> summary.txt
-            elif grep -q "\[BACKUP_STATUS\] SKIP" /tmp/vps.log; then
-              echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
-            else
-              # NẾU CÓ LỖI: In toàn bộ log tạm ra GitHub Actions để bạn debug
-              echo "::error title=Backup Failed::Phát hiện lỗi trên server $HOSTNAME"
-              cat /tmp/vps.log
+            if [ "$STATUS" == "SUCCESS" ]; then
+              echo "- 🖥️ **$NAME**: ✅ Backup OK (\`$EXTRA\`)" >> summary.txt
+            elif [ "$STATUS" == "SKIP" ]; then
+              echo "- 🖥️ **$NAME**: 💤 Không đổi (Skip)" >> summary.txt
+            elif [ "$STATUS" == "ERROR" ]; then
+              LOG_FILE="$EXTRA"
+              echo "::error title=Backup Failed::Phát hiện lỗi trên server $NAME"
+              cat "$LOG_FILE"
               echo "----------------------------------------"
               
-              if grep -q "\[BACKUP_STATUS\] ERROR_UPLOAD" /tmp/vps.log; then
-                echo "- 🖥️ **$HOSTNAME**: ❌ Lỗi Google Drive (Rclone)" >> summary.txt
+              if grep -q "\[BACKUP_STATUS\] ERROR_UPLOAD" "$LOG_FILE"; then
+                echo "- 🖥️ **$NAME**: ❌ Lỗi Google Drive (Rclone)" >> summary.txt
               else
-                echo "- 🖥️ **$HOSTNAME**: ❌ Offline hoặc Lỗi SSH" >> summary.txt
+                echo "- 🖥️ **$NAME**: ❌ Offline hoặc Lỗi SSH" >> summary.txt
               fi
             fi
-            
-          done 3< server_list.txt
+          done < results.txt
 
-          # Gửi báo cáo về Discord
+          # 5. Gửi báo cáo về Discord
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
