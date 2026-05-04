@@ -14,15 +14,21 @@ jobs:
       - name: Setup SSH Key & Local Files
         run: |
           mkdir -p ~/.ssh ~/.config/rclone
-          # Tạo SSH Key
+          # 1. Khởi tạo SSH Key
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_backup_key
           chmod 600 ~/.ssh/id_backup_key
           
-          # Giải mã rclone.conf thành file thật trên máy ảo Github Runner
-          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          # 2. Giải mã file rclone.conf (Xóa bỏ khoảng trắng rác nếu có)
+          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | tr -d '[:space:]' | base64 -d > ~/.config/rclone/rclone.conf
           chmod +x ./backup_logic.sh
 
-      - name: Execution with SCP
+          # 3. DEBUG: Xem file trên máy GitHub có bị rỗng không
+          echo "=== DEBUG TRÊN GITHUB RUNNER ==="
+          ls -la ~/.config/rclone/rclone.conf
+          echo "Kích thước file trên GitHub: $(wc -c < ~/.config/rclone/rclone.conf) bytes"
+          echo "================================="
+
+      - name: Execution with Debug
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SSH_OPTS: "-i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30"
@@ -45,27 +51,33 @@ jobs:
             IP=$(echo "$IP_PORT" | cut -d':' -f1)
             PORT=$(echo "$IP_PORT" | cut -s -d':' -f2); PORT=${PORT:-22}
             
-            # Giấu thông tin nhạy cảm trên log
+            # Masking để giấu IP/Hostname
             echo "::add-mask::$IP"
             echo "::add-mask::$HOSTNAME"
             
             echo "----------------------------------------"
             echo "Processing Server: ***" 
             
-            # 1. Khởi tạo thư mục trên VPS
+            # 1. Tạo thư mục trên VPS & Cài đặt rclone (nếu chưa có)
             ssh -n -q -p $PORT $SSH_OPTS root@$IP "mkdir -p /root/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl -s https://rclone.org/install.sh | bash; fi" || true
             
-            # 2. Dùng SCP để đẩy file qua - Cực kỳ an toàn, file sao y bản chính 100%
-            scp -q -P $PORT $SSH_OPTS ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf || true
-            scp -q -P $PORT $SSH_OPTS ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager || true
+            # 2. Đẩy file rclone.conf qua chuyển hướng chuẩn (Tránh lỗi 0 byte)
+            ssh -q -p $PORT $SSH_OPTS root@$IP "cat > /root/.config/rclone/rclone.conf" < ~/.config/rclone/rclone.conf || true
             
-            # 3. Chạy lệnh backup và in log debug
-            ssh -n -q -p $PORT $SSH_OPTS root@$IP "chmod +x /usr/local/bin/vps-manager" || true
+            # 3. Đẩy file script backup_logic.sh
+            ssh -q -p $PORT $SSH_OPTS root@$IP "cat > /usr/local/bin/vps-manager && chmod +x /usr/local/bin/vps-manager" < ./backup_logic.sh || true
+            
+            # 4. DEBUG TRÊN VPS: In ra kích thước file config vừa copy lên VPS
+            echo "--- DEBUG TRÊN VPS ---"
+            ssh -n -q -p $PORT $SSH_OPTS root@$IP "ls -la /root/.config/rclone/rclone.conf && echo 'File trên VPS nhận được:' && wc -c < /root/.config/rclone/rclone.conf" || true
+            echo "----------------------"
+
+            # 5. Chạy backup và in log
             RAW_OUTPUT=$(ssh -n -q -p $PORT $SSH_OPTS root@$IP "/usr/local/bin/vps-manager backup" || echo "[BACKUP_STATUS] ERROR_SSH")
             
             echo "$RAW_OUTPUT"
             
-            # 4. Phân tích kết quả
+            # 6. Phân tích kết quả
             if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
               echo "- 🖥️ **$HOSTNAME**: 💤 Không đổi (Skip)" >> summary.txt
             elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
@@ -79,7 +91,7 @@ jobs:
             
           done 3< server_list.txt
 
-          # 5. Gửi báo cáo về Discord
+          # 7. Gửi báo cáo về Discord
           if [ -n "$WEBHOOK" ] && [ -s summary.txt ]; then
             jq -n --rawfile desc summary.txt '{
               embeds: [{
