@@ -30,25 +30,48 @@ jobs:
           curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
                -L "${{ secrets.SERVER_LIST_URL }}" -o server_list.txt
 
+          # Biến lưu trữ báo cáo tổng hợp
+          DISCORD_SUMMARY=""
+
           while IFS='|' read -u 3 -r IP_PORT HOSTNAME; do
             [[ $IP_PORT =~ ^# || -z $IP_PORT ]] && continue
             
-            echo "::add-mask::$IP_PORT"
-            echo "::add-mask::$HOSTNAME"
-            
             IP=$(echo $IP_PORT | cut -d':' -f1); PORT=$(echo $IP_PORT | cut -s -d':' -f2); PORT=${PORT:-22}
+            echo "--- Processing: $HOSTNAME ---"
             
-            # 1. Setup VPS
-            ssh -n -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP \
-                "mkdir -p ~/.config/rclone /usr/local/bin && \
-                 echo '$HOSTNAME' > /etc/vps_id && \
-                 if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi" < /dev/null
-
-            # 2. Upload Config & Script
+            # Setup & Đẩy script (Như cũ)
+            ssh -n -q -p $PORT -i ~/.ssh/id_backup_key -o StrictHostKeyChecking=no root@$IP "mkdir -p ~/.config/rclone /usr/local/bin && echo '$HOSTNAME' > /etc/vps_id && if ! command -v rclone &> /dev/null; then curl https://rclone.org/install.sh | bash; fi" < /dev/null
             scp -q -P $PORT -i ~/.ssh/id_backup_key ~/.config/rclone/rclone.conf root@$IP:/root/.config/rclone/rclone.conf
             scp -q -P $PORT -i ~/.ssh/id_backup_key ./backup_logic.sh root@$IP:/usr/local/bin/vps-manager
             
-            # 3. Chạy Backup (Truyền thêm biến DISCORD_WEBHOOK)
-            ssh -n -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && export DISCORD_WEBHOOK='$WEBHOOK'; /usr/local/bin/vps-manager backup" < /dev/null
+            # CHẠY VÀ BẮT KẾT QUẢ TỪ VPS
+            RAW_OUTPUT=$(ssh -n -q -p $PORT -i ~/.ssh/id_backup_key root@$IP "chmod +x /usr/local/bin/vps-manager && /usr/local/bin/vps-manager backup" < /dev/null)
+            
+            # In log ra màn hình Action để tiện debug
+            echo "$RAW_OUTPUT"
+
+            # Phân tích kết quả và nối vào bảng thông báo tổng
+            if echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SKIP"; then
+              DISCORD_SUMMARY+="- 🖥️ **$HOSTNAME**: 💤 Không đổi (Bỏ qua)\n"
+            elif echo "$RAW_OUTPUT" | grep -q "\[BACKUP_STATUS\] SUCCESS"; then
+              SIZE=$(echo "$RAW_OUTPUT" | grep "\[BACKUP_STATUS\] SUCCESS" | cut -d'|' -f2)
+              DISCORD_SUMMARY+="- 🖥️ **$HOSTNAME**: ✅ Hoàn tất (\`$SIZE\`)\n"
+            else
+              DISCORD_SUMMARY+="- 🖥️ **$HOSTNAME**: ❌ Lỗi hoặc không phản hồi\n"
+            fi
             
           done 3< server_list.txt
+
+          # GỬI ĐÚNG 1 TIN NHẮN TỔNG HỢP LÊN DISCORD
+          if [ -n "$WEBHOOK" ]; then
+            jq -n --arg desc "$DISCORD_SUMMARY" '{
+              embeds: [{
+                title: "📊 Báo Cáo Tổng Hợp GitOps Backup",
+                description: $desc,
+                color: 3066993,
+                footer: {text: "Giữ 10 bản • Xóa vĩnh viễn Drive Trash"}
+              }]
+            }' > discord.json
+            
+            curl -s -H "Content-Type: application/json" -d @discord.json "$WEBHOOK" > /dev/null
+          fi
